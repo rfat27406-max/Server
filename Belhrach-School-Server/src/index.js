@@ -93,6 +93,30 @@ async function hmac(value, secret) {
 }
 
 // ==========================================
+// ACTIVATION CODE
+// ==========================================
+
+function generateActivationCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+
+  const raw = [...bytes]
+    .map(value => value.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
+
+  return raw.match(/.{4}/g).join("-");
+}
+
+async function hashActivationCode(code) {
+  const normalizedCode = String(code ?? "")
+    .replace(/-/g, "")
+    .replace(/\s/g, "")
+    .toUpperCase();
+
+  return digest(normalizedCode);
+}
+
+// ==========================================
 // COOKIE
 // ==========================================
 
@@ -627,23 +651,115 @@ async function handle(request, env) {
       }, 400);
     }
 
-    const result = await env.DB.prepare(`
-      UPDATE student_requests
-      SET status=?
-      WHERE id=? AND status='pending'
-    `)
-      .bind(data.status, match[1])
-      .run();
+    const studentId = match[1];
 
-    if (!result.meta?.changes) {
+    // Check that the request exists and is still pending.
+    const student = await env.DB.prepare(`
+      SELECT id, status
+      FROM student_requests
+      WHERE id=?
+    `)
+      .bind(studentId)
+      .first();
+
+    if (!student || student.status !== "pending") {
       return json({
         error: "الطلب غير موجود أو تمت معالجته سابقاً"
       }, 409);
     }
 
+    // --------------------------------------
+    // REJECT REQUEST
+    // --------------------------------------
+
+    if (data.status === "rejected") {
+      const result = await env.DB.prepare(`
+        UPDATE student_requests
+        SET status='rejected'
+        WHERE id=? AND status='pending'
+      `)
+        .bind(studentId)
+        .run();
+
+      if (!result.meta?.changes) {
+        return json({
+          error: "الطلب غير موجود أو تمت معالجته سابقاً"
+        }, 409);
+      }
+
+      return json({
+        ok: true,
+        status: "rejected"
+      });
+    }
+
+    // --------------------------------------
+    // APPROVE REQUEST + CREATE ACTIVATION CODE
+    // --------------------------------------
+
+    const activationCode = generateActivationCode();
+    const activationHash = await hashActivationCode(
+      activationCode
+    );
+
+    const activationId = crypto.randomUUID();
+    const now = Date.now();
+
+    // Both statements execute together as a D1 batch.
+    // The code hash is stored, never the original code.
+    const results = await env.DB.batch([
+      env.DB.prepare(`
+        UPDATE student_requests
+        SET status='approved'
+        WHERE id=? AND status='pending'
+      `).bind(studentId),
+
+      env.DB.prepare(`
+        INSERT INTO student_activation_codes
+        (id, student_id, code_hash, created_at)
+        SELECT ?, id, ?, ?
+        FROM student_requests
+        WHERE id=?
+          AND status='approved'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM student_activation_codes
+            WHERE student_id=?
+          )
+      `).bind(
+        activationId,
+        activationHash,
+        now,
+        studentId,
+        studentId
+      )
+    ]);
+
+    const updated = results[0]?.meta?.changes || 0;
+    const inserted = results[1]?.meta?.changes || 0;
+
+    if (!updated) {
+      return json({
+        error: "الطلب غير موجود أو تمت معالجته سابقاً"
+      }, 409);
+    }
+
+    if (!inserted) {
+      console.error(
+        "Activation code was not inserted for student:",
+        studentId
+      );
+
+      return json({
+        error: "تم قبول الطلب لكن تعذر إنشاء رمز التفعيل. يرجى مراجعة قاعدة البيانات."
+      }, 500);
+    }
+
+    // The original activation code is returned only once.
     return json({
       ok: true,
-      status: data.status
+      status: "approved",
+      activationCode
     });
   }
 
