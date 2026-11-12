@@ -1,3 +1,4 @@
+
 name = "belhrach-school-api"
 main = "src/index.js"
 compatibility_date = "2026-11-12"
@@ -6,7 +7,7 @@ compatibility_date = "2026-11-12"
 binding = "DB"
 database_name = "belhrach-school"
 database_id = "acd08ecd-2aa0-4c98-a523-db1dc1817152"
-[vars]
+
 [vars]
 ADMIN_ORIGIN = "https://admin-4of.pages.dev"
 STUDENT_ORIGIN = "https://students-7w6.pages.dev"
