@@ -7,5 +7,6 @@ binding = "DB"
 database_name = "belhrach-school"
 database_id = "acd08ecd-2aa0-4c98-a523-db1dc1817152"
 [vars]
-STUDENT_ORIGIN = "https://YOUR-STUDENT-PAGES.pages.dev"
-ADMIN_ORIGIN = "https://YOUR-ADMIN-PAGES.pages.dev"
+[vars]
+ADMIN_ORIGIN = "https://admin-4of.pages.dev"
+STUDENT_ORIGIN = "https://students-7w6.pages.dev"
