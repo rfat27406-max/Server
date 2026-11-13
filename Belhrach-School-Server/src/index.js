@@ -982,15 +982,32 @@ async function handle(request, env) {
         c.name AS className,
         r.status,
         r.created_at AS createdAt,
-        r.reviewed_at AS reviewedAt
+        r.reviewed_at AS reviewedAt,
+        r.student_id AS studentId,
+
+        CASE
+          WHEN sc.id IS NOT NULL THEN 1
+          ELSE 0
+        END AS deviceRegistered
+
       FROM student_requests r
-      JOIN classes c ON c.id = r.class_id
+
+      JOIN classes c
+        ON c.id = r.class_id
+
+      LEFT JOIN student_credentials sc
+        ON sc.student_id = r.student_id
+        AND sc.revoked_at IS NULL
+
       ORDER BY r.created_at DESC
       LIMIT 200
     `).all();
 
     return json({
-      requests: result.results || []
+      requests: (result.results || []).map(item => ({
+        ...item,
+        deviceRegistered: Boolean(item.deviceRegistered)
+      }))
     });
   }
 
