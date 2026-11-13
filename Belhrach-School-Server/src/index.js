@@ -1633,18 +1633,31 @@ async function handle(request, env) {
         r.student_id AS studentId,
 
         CASE
-          WHEN sc.id IS NOT NULL THEN 1
+          WHEN EXISTS (
+            SELECT 1
+            FROM student_credentials sc
+            WHERE sc.student_id = r.student_id
+              AND sc.revoked_at IS NULL
+          )
+          THEN 1
           ELSE 0
-        END AS deviceRegistered
+        END AS deviceRegistered,
+
+        CASE
+          WHEN EXISTS (
+            SELECT 1
+            FROM student_credentials revoked
+            WHERE revoked.student_id = r.student_id
+              AND revoked.revoked_at IS NOT NULL
+          )
+          THEN 1
+          ELSE 0
+        END AS deviceRevoked
 
       FROM student_requests r
 
       JOIN classes c
         ON c.id = r.class_id
-
-      LEFT JOIN student_credentials sc
-        ON sc.student_id = r.student_id
-        AND sc.revoked_at IS NULL
 
       ORDER BY r.created_at DESC
       LIMIT 200
@@ -1653,12 +1666,15 @@ async function handle(request, env) {
     return json({
       requests: (result.results || []).map(item => ({
         ...item,
-        deviceRegistered: Boolean(item.deviceRegistered)
+        deviceRegistered: Boolean(item.deviceRegistered),
+        deviceRevoked: Boolean(item.deviceRevoked)
       }))
     });
   }
 
+  // ==========================================
   // ADMIN: GET STUDENTS BY CLASS
+  // ==========================================
 
   const classStudentsMatch = path.match(
     /^\/api\/admin\/classes\/(.+)\/students$/
@@ -1748,35 +1764,49 @@ async function handle(request, env) {
         : null;
 
       return {
-        ...student,
+        id: student.id,
+        firstName: student.firstName,
+        lastName: student.lastName,
+        accountStatus: student.accountStatus,
+        createdAt: student.createdAt,
+
         deviceRegistered: Boolean(student.deviceRegistered),
         deviceRevoked: Boolean(student.deviceRevoked),
+
         attendanceStatus: student.accountStatus === "active"
           ? getAttendanceStatus(record, clock)
-          : "suspended"
+          : "suspended",
+
+        checkInAt: student.checkInAt
       };
     });
 
     return json({
       ok: true,
+
       class: {
         id: selectedClass.id,
         name: selectedClass.name
       },
-      date: clock.date,
-      currentTime: clock.time,
-      timezone: clock.timezone,
-      attendanceTimes: {
+
+      total: students.length,
+
+      attendance: {
+        date: clock.date,
+        time: clock.time,
+        timezone: clock.timezone,
         openingTime: clock.openingTime,
         lateTime: clock.lateTime,
         closingTime: clock.closingTime
       },
-      total: students.length,
+
       students
     });
   }
 
+  // ==========================================
   // ADMIN: APPROVE / REJECT REQUEST
+  // ==========================================
 
   const match = path.match(
     /^\/api\/admin\/requests\/([0-9a-f-]{36})$/i
@@ -1931,7 +1961,9 @@ async function handle(request, env) {
     });
   }
 
+  // ==========================================
   // NOT FOUND
+  // ==========================================
 
   return json({
     error: "المسار غير موجود"
