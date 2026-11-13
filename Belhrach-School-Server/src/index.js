@@ -1,4 +1,9 @@
 
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse
+} from "@simplewebauthn/server";
+
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8"
 };
@@ -8,6 +13,8 @@ const encoder = new TextEncoder();
 const COOKIE = "bs_admin_session";
 const SESSION_SECONDS = 8 * 60 * 60;
 const MAX_BODY_SIZE = 5000;
+const MAX_WEBAUTHN_BODY_SIZE = 100 * 1024;
+const CHALLENGE_TTL = 5 * 60 * 1000;
 
 // ==========================================
 // JSON RESPONSE
@@ -104,7 +111,7 @@ async function hmac(value, secret) {
 // REQUEST BODY
 // ==========================================
 
-async function body(request) {
+async function readJsonBody(request, maxSize) {
   const contentType = request.headers.get("Content-Type") || "";
 
   if (!contentType.toLowerCase().includes("application/json")) {
@@ -115,13 +122,13 @@ async function body(request) {
     request.headers.get("Content-Length") || 0
   );
 
-  if (declaredLength > MAX_BODY_SIZE) {
+  if (declaredLength > maxSize) {
     throw new Error("حجم البيانات كبير");
   }
 
   const buffer = await request.arrayBuffer();
 
-  if (buffer.byteLength > MAX_BODY_SIZE) {
+  if (buffer.byteLength > maxSize) {
     throw new Error("حجم البيانات كبير");
   }
 
@@ -138,6 +145,14 @@ async function body(request) {
   }
 
   return data;
+}
+
+async function body(request) {
+  return readJsonBody(request, MAX_BODY_SIZE);
+}
+
+async function webauthnBody(request) {
+  return readJsonBody(request, MAX_WEBAUTHN_BODY_SIZE);
 }
 
 // ==========================================
@@ -247,6 +262,13 @@ function validOrigin(request, env) {
   return !!origin && allowedOrigins(env).includes(origin);
 }
 
+function validStudentOrigin(request, env) {
+  return (
+    !!env.STUDENT_ORIGIN &&
+    request.headers.get("Origin") === env.STUDENT_ORIGIN
+  );
+}
+
 function corsHeaders(origin, env) {
   if (!origin || !allowedOrigins(env).includes(origin)) {
     return {};
@@ -322,6 +344,361 @@ async function requireAdmin(request, env) {
 }
 
 // ==========================================
+// WEBAUTHN HELPERS
+// ==========================================
+
+function getWebAuthnConfig(env) {
+  if (!env.STUDENT_ORIGIN) {
+    throw new Error("STUDENT_ORIGIN is missing");
+  }
+
+  const origin = new URL(env.STUDENT_ORIGIN);
+
+  if (origin.protocol !== "https:") {
+    throw new Error("WebAuthn requires HTTPS");
+  }
+
+  return {
+    expectedOrigin: origin.origin,
+    rpID: origin.hostname,
+    rpName: "Belhrach School"
+  };
+}
+
+function bearerToken(request) {
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+
+  return match ? match[1].trim() : "";
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+async function getApprovedStudent(env, token) {
+  if (!token || token.length < 50 || token.length > 150) {
+    return null;
+  }
+
+  return await env.DB.prepare(`
+    SELECT
+      r.id AS request_id,
+      r.status AS request_status,
+      s.id AS student_id,
+      s.first_name,
+      s.last_name,
+      s.account_status
+    FROM student_requests r
+    JOIN students s ON s.id = r.student_id
+    WHERE r.tracking_token_hash = ?
+      AND r.status = 'approved'
+      AND s.account_status = 'active'
+    LIMIT 1
+  `)
+    .bind(await digest(token))
+    .first();
+}
+
+// ==========================================
+// WEBAUTHN: REGISTRATION OPTIONS
+// ==========================================
+
+async function registrationOptions(request, env) {
+  if (!validStudentOrigin(request, env)) {
+    return json({ error: "مصدر الطلب غير مسموح" }, 403);
+  }
+
+  const token = bearerToken(request);
+  const student = await getApprovedStudent(env, token);
+
+  if (!student) {
+    return json({
+      error: "الحساب غير موجود أو غير مفعل"
+    }, 401);
+  }
+
+  // Check whether the student already has a credential.
+  // A revoked credential also blocks self-service replacement.
+  const existing = await env.DB.prepare(`
+    SELECT id, revoked_at
+    FROM student_credentials
+    WHERE student_id = ?
+    LIMIT 1
+  `)
+    .bind(student.student_id)
+    .first();
+
+  if (existing) {
+    return json({
+      error: existing.revoked_at
+        ? "تم إلغاء الجهاز السابق. يرجى التواصل مع الإدارة لإعادة ربط جهازك."
+        : "تم ربط جهاز بحسابك مسبقاً."
+    }, 409);
+  }
+
+  const config = getWebAuthnConfig(env);
+
+  const options = await generateRegistrationOptions({
+    rpName: config.rpName,
+    rpID: config.rpID,
+    userID: encoder.encode(student.student_id),
+    userName: `${student.first_name} ${student.last_name}`,
+    userDisplayName: `${student.first_name} ${student.last_name}`,
+    attestationType: "none",
+    timeout: 60000,
+    authenticatorSelection: {
+      residentKey: "preferred",
+      userVerification: "required"
+    }
+  });
+
+  const now = Date.now();
+  const challengeId = crypto.randomUUID();
+
+  // Clean expired challenges for this student.
+  await env.DB.prepare(`
+    DELETE FROM webauthn_challenges
+    WHERE student_id = ?
+      AND purpose = 'registration'
+      AND expires_at <= ?
+  `)
+    .bind(student.student_id, now)
+    .run();
+
+  await env.DB.prepare(`
+    INSERT INTO webauthn_challenges (
+      id,
+      challenge,
+      student_id,
+      purpose,
+      expires_at,
+      created_at
+    )
+    VALUES (?, ?, ?, 'registration', ?, ?)
+  `)
+    .bind(
+      challengeId,
+      options.challenge,
+      student.student_id,
+      now + CHALLENGE_TTL,
+      now
+    )
+    .run();
+
+  return json({
+    options,
+    challengeId
+  });
+}
+
+// ==========================================
+// WEBAUTHN: VERIFY REGISTRATION
+// ==========================================
+
+async function verifyRegistration(request, env) {
+  if (!validStudentOrigin(request, env)) {
+    return json({ error: "مصدر الطلب غير مسموح" }, 403);
+  }
+
+  let data;
+
+  try {
+    data = await webauthnBody(request);
+  } catch {
+    return json({ error: "بيانات التسجيل غير صالحة" }, 400);
+  }
+
+  const token = bearerToken(request);
+  const student = await getApprovedStudent(env, token);
+
+  if (!student) {
+    return json({
+      error: "الحساب غير موجود أو غير مفعل"
+    }, 401);
+  }
+
+  const challengeId = String(data.challengeId || "");
+
+  if (!/^[0-9a-f-]{36}$/i.test(challengeId)) {
+    return json({ error: "طلب التسجيل غير صالح" }, 400);
+  }
+
+  if (!data.response || typeof data.response !== "object") {
+    return json({ error: "استجابة الجهاز غير صالحة" }, 400);
+  }
+
+  const now = Date.now();
+
+  const challengeRow = await env.DB.prepare(`
+    SELECT id, challenge
+    FROM webauthn_challenges
+    WHERE id = ?
+      AND student_id = ?
+      AND purpose = 'registration'
+      AND expires_at > ?
+    LIMIT 1
+  `)
+    .bind(challengeId, student.student_id, now)
+    .first();
+
+  if (!challengeRow) {
+    return json({
+      error: "انتهت صلاحية طلب التسجيل. حاول مجدداً."
+    }, 400);
+  }
+
+  const config = getWebAuthnConfig(env);
+
+  let verification;
+
+  try {
+    verification = await verifyRegistrationResponse({
+      response: data.response,
+      expectedChallenge: challengeRow.challenge,
+      expectedOrigin: config.expectedOrigin,
+      expectedRPID: config.rpID,
+      requireUserVerification: true
+    });
+  } catch (error) {
+    console.error(
+      "WebAuthn registration verification failed:",
+      error
+    );
+
+    return json({
+      error: "تعذر التحقق من الجهاز. حاول مجدداً."
+    }, 400);
+  }
+
+  if (
+    !verification.verified ||
+    !verification.registrationInfo
+  ) {
+    return json({
+      error: "لم ينجح التحقق من الجهاز"
+    }, 400);
+  }
+
+  const credential = verification.registrationInfo.credential;
+
+  const credentialId = credential.id;
+  const publicKey = bytesToBase64Url(credential.publicKey);
+  const signCount = credential.counter || 0;
+  const transports = JSON.stringify(
+    credential.transports || []
+  );
+
+  const deviceName = clean(
+    data.deviceName || "جهاز التلميذ",
+    100
+  );
+
+  try {
+    // The INSERT is conditional on the challenge still existing.
+    // UNIQUE(student_id) and UNIQUE(credential_id) are additional
+    // database-level protections against duplicate registration.
+    const result = await env.DB.prepare(`
+      INSERT INTO student_credentials (
+        id,
+        student_id,
+        credential_id,
+        public_key,
+        sign_count,
+        device_name,
+        transports,
+        created_at,
+        last_used_at,
+        revoked_at
+      )
+      SELECT
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL
+      WHERE EXISTS (
+        SELECT 1
+        FROM webauthn_challenges
+        WHERE id = ?
+          AND student_id = ?
+          AND purpose = 'registration'
+          AND expires_at > ?
+      )
+    `)
+      .bind(
+        crypto.randomUUID(),
+        student.student_id,
+        credentialId,
+        publicKey,
+        signCount,
+        deviceName,
+        transports,
+        now,
+        now,
+        challengeId,
+        student.student_id,
+        now
+      )
+      .run();
+
+    if (!result.meta?.changes) {
+      return json({
+        error: "انتهت صلاحية طلب التسجيل أو تمت معالجته مسبقاً."
+      }, 409);
+    }
+
+    // Consume the challenge after successful credential insertion.
+    await env.DB.prepare(`
+      DELETE FROM webauthn_challenges
+      WHERE id = ?
+        AND student_id = ?
+        AND purpose = 'registration'
+    `)
+      .bind(challengeId, student.student_id)
+      .run();
+
+  } catch (error) {
+    console.error("Credential storage failed:", error);
+
+    return json({
+      error: "تعذر حفظ الجهاز. ربما تم ربط جهاز بحسابك مسبقاً."
+    }, 409);
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO attendance_audit (
+      id,
+      admin_action,
+      target_student_id,
+      details,
+      created_at
+    )
+    VALUES (?, 'student_device_registered', ?, ?, ?)
+  `)
+    .bind(
+      crypto.randomUUID(),
+      student.student_id,
+      JSON.stringify({
+        deviceName
+      }),
+      now
+    )
+    .run();
+
+  return json({
+    ok: true,
+    registered: true,
+    message: "تم ربط جهازك بنجاح"
+  });
+}
+
+// ==========================================
 // MAIN API
 // ==========================================
 
@@ -380,7 +757,6 @@ async function handle(request, env) {
       }, 400);
     }
 
-    // Find the selected class
     const selectedClass = await env.DB.prepare(`
       SELECT id, name
       FROM classes
@@ -440,9 +816,7 @@ async function handle(request, env) {
     path === "/api/student/status" &&
     method === "GET"
   ) {
-    const token = (
-      request.headers.get("Authorization") || ""
-    ).replace(/^Bearer\s+/i, "");
+    const token = bearerToken(request);
 
     if (token.length < 50 || token.length > 150) {
       return json({
@@ -468,6 +842,28 @@ async function handle(request, env) {
       status: row.status,
       setupAvailable: row.status === "approved" && !!row.student_id
     });
+  }
+
+  // ========================================
+  // STUDENT: WEBAUTHN REGISTRATION OPTIONS
+  // ========================================
+
+  if (
+    path === "/api/student/webauthn/register/options" &&
+    method === "POST"
+  ) {
+    return await registrationOptions(request, env);
+  }
+
+  // ========================================
+  // STUDENT: WEBAUTHN REGISTRATION VERIFY
+  // ========================================
+
+  if (
+    path === "/api/student/webauthn/register/verify" &&
+    method === "POST"
+  ) {
+    return await verifyRegistration(request, env);
   }
 
   // ========================================
@@ -640,10 +1036,7 @@ async function handle(request, env) {
       }, 409);
     }
 
-    // --------------------------------------
     // REJECT
-    // --------------------------------------
-
     if (data.status === "rejected") {
       const result = await env.DB.prepare(`
         UPDATE student_requests
@@ -684,10 +1077,7 @@ async function handle(request, env) {
       });
     }
 
-    // --------------------------------------
     // APPROVE: CREATE STUDENT ACCOUNT
-    // --------------------------------------
-
     const studentId = crypto.randomUUID();
 
     const results = await env.DB.batch([
