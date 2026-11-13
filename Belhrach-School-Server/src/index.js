@@ -427,8 +427,6 @@ async function registrationOptions(request, env) {
     }, 401);
   }
 
-  // Check whether the student already has a credential.
-  // A revoked credential also blocks self-service replacement.
   const existing = await env.DB.prepare(`
     SELECT id, revoked_at
     FROM student_credentials
@@ -465,7 +463,6 @@ async function registrationOptions(request, env) {
   const now = Date.now();
   const challengeId = crypto.randomUUID();
 
-  // Clean expired challenges for this student.
   await env.DB.prepare(`
     DELETE FROM webauthn_challenges
     WHERE student_id = ?
@@ -604,9 +601,6 @@ async function verifyRegistration(request, env) {
   );
 
   try {
-    // The INSERT is conditional on the challenge still existing.
-    // UNIQUE(student_id) and UNIQUE(credential_id) are additional
-    // database-level protections against duplicate registration.
     const result = await env.DB.prepare(`
       INSERT INTO student_credentials (
         id,
@@ -653,7 +647,6 @@ async function verifyRegistration(request, env) {
       }, 409);
     }
 
-    // Consume the challenge after successful credential insertion.
     await env.DB.prepare(`
       DELETE FROM webauthn_challenges
       WHERE id = ?
@@ -684,9 +677,7 @@ async function verifyRegistration(request, env) {
     .bind(
       crypto.randomUUID(),
       student.student_id,
-      JSON.stringify({
-        deviceName
-      }),
+      JSON.stringify({ deviceName }),
       now
     )
     .run();
@@ -707,7 +698,10 @@ async function handle(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // CORS preflight
+  // ========================================
+  // CORS PREFLIGHT
+  // ========================================
+
   if (method === "OPTIONS") {
     return new Response(null, { status: 204 });
   }
@@ -1008,6 +1002,100 @@ async function handle(request, env) {
         ...item,
         deviceRegistered: Boolean(item.deviceRegistered)
       }))
+    });
+  }
+
+  // ========================================
+  // ADMIN: GET STUDENTS BY CLASS
+  // ========================================
+
+  const classStudentsMatch = path.match(
+    /^\/api\/admin\/classes\/(.+)\/students$/
+  );
+
+  if (classStudentsMatch && method === "GET") {
+    if (!await requireAdmin(request, env)) {
+      return json({ error: "غير مصرح" }, 401);
+    }
+
+    let className;
+
+    try {
+      className = clean(
+        decodeURIComponent(classStudentsMatch[1]),
+        40
+      );
+    } catch {
+      return json({ error: "اسم القسم غير صالح" }, 400);
+    }
+
+    if (!className) {
+      return json({ error: "اسم القسم مطلوب" }, 400);
+    }
+
+    const selectedClass = await env.DB.prepare(`
+      SELECT id, name
+      FROM classes
+      WHERE name = ?
+      LIMIT 1
+    `)
+      .bind(className)
+      .first();
+
+    if (!selectedClass) {
+      return json({ error: "القسم غير موجود" }, 404);
+    }
+
+    const result = await env.DB.prepare(`
+      SELECT
+        s.id,
+        s.first_name AS firstName,
+        s.last_name AS lastName,
+        s.account_status AS accountStatus,
+        s.created_at AS createdAt,
+
+        CASE
+          WHEN sc.id IS NOT NULL
+            AND sc.revoked_at IS NULL
+          THEN 1
+          ELSE 0
+        END AS deviceRegistered,
+
+        CASE
+          WHEN sc.id IS NOT NULL
+            AND sc.revoked_at IS NOT NULL
+          THEN 1
+          ELSE 0
+        END AS deviceRevoked
+
+      FROM students s
+
+      LEFT JOIN student_credentials sc
+        ON sc.student_id = s.id
+
+      WHERE s.class_id = ?
+
+      ORDER BY
+        s.first_name COLLATE NOCASE ASC,
+        s.last_name COLLATE NOCASE ASC
+    `)
+      .bind(selectedClass.id)
+      .all();
+
+    const students = (result.results || []).map(student => ({
+      ...student,
+      deviceRegistered: Boolean(student.deviceRegistered),
+      deviceRevoked: Boolean(student.deviceRevoked)
+    }));
+
+    return json({
+      ok: true,
+      class: {
+        id: selectedClass.id,
+        name: selectedClass.name
+      },
+      total: students.length,
+      students
     });
   }
 
