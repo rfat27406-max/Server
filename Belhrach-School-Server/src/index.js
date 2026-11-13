@@ -467,7 +467,6 @@ async function getAttendanceClock(env) {
   }
 
   const timezone = settings.timezone || "Africa/Algiers";
-
   const now = new Date();
 
   const parts = new Intl.DateTimeFormat("en-GB", {
@@ -1436,9 +1435,27 @@ async function handle(request, env) {
     }
 
     const row = await env.DB.prepare(`
-      SELECT status, student_id
-      FROM student_requests
-      WHERE tracking_token_hash = ?
+      SELECT
+        r.status,
+        r.student_id,
+
+        EXISTS (
+          SELECT 1
+          FROM student_credentials sc
+          WHERE sc.student_id = r.student_id
+            AND sc.revoked_at IS NULL
+        ) AS device_registered,
+
+        EXISTS (
+          SELECT 1
+          FROM student_credentials sc
+          WHERE sc.student_id = r.student_id
+            AND sc.revoked_at IS NOT NULL
+        ) AS device_revoked
+
+      FROM student_requests r
+      WHERE r.tracking_token_hash = ?
+      LIMIT 1
     `)
       .bind(await digest(token))
       .first();
@@ -1451,7 +1468,9 @@ async function handle(request, env) {
 
     return json({
       status: row.status,
-      setupAvailable: row.status === "approved" && !!row.student_id
+      setupAvailable: row.status === "approved" && !!row.student_id,
+      deviceRegistered: Boolean(row.device_registered),
+      deviceRevoked: Boolean(row.device_revoked)
     });
   }
 
