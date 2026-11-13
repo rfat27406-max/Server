@@ -37,6 +37,14 @@ function normalize(value) {
     .toLocaleLowerCase("ar");
 }
 
+function clean(value, max) {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, max);
+}
+
 function safeEqual(a, b) {
   const x = encoder.encode(String(a ?? ""));
   const y = encoder.encode(String(b ?? ""));
@@ -93,31 +101,47 @@ async function hmac(value, secret) {
 }
 
 // ==========================================
-// ACTIVATION CODE
+// REQUEST BODY
 // ==========================================
 
-function generateActivationCode() {
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
+async function body(request) {
+  const contentType = request.headers.get("Content-Type") || "";
 
-  const raw = [...bytes]
-    .map(value => value.toString(16).padStart(2, "0"))
-    .join("")
-    .toUpperCase();
+  if (!contentType.toLowerCase().includes("application/json")) {
+    throw new Error("نوع البيانات غير صالح");
+  }
 
-  return raw.match(/.{4}/g).join("-");
-}
+  const declaredLength = Number(
+    request.headers.get("Content-Length") || 0
+  );
 
-async function hashActivationCode(code) {
-  const normalizedCode = String(code ?? "")
-    .replace(/-/g, "")
-    .replace(/\s/g, "")
-    .toUpperCase();
+  if (declaredLength > MAX_BODY_SIZE) {
+    throw new Error("حجم البيانات كبير");
+  }
 
-  return digest(normalizedCode);
+  const buffer = await request.arrayBuffer();
+
+  if (buffer.byteLength > MAX_BODY_SIZE) {
+    throw new Error("حجم البيانات كبير");
+  }
+
+  const data = JSON.parse(
+    new TextDecoder().decode(buffer)
+  );
+
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data)
+  ) {
+    throw new Error("بيانات غير صالحة");
+  }
+
+  return data;
 }
 
 // ==========================================
-// COOKIE
+// COOKIE AND SESSION
 // ==========================================
 
 function cookieValue(request, name) {
@@ -130,20 +154,16 @@ function cookieValue(request, name) {
 
   if (!part) return "";
 
-  const value = part.slice(name.length + 1);
-
   try {
-    return decodeURIComponent(value);
+    return decodeURIComponent(
+      part.slice(name.length + 1)
+    );
   } catch {
     return "";
   }
 }
 
 async function makeSession(env) {
-  if (!env.SESSION_SECRET) {
-    throw new Error("SESSION_SECRET is missing");
-  }
-
   const payload = btoa(JSON.stringify({
     exp: Math.floor(Date.now() / 1000) + SESSION_SECONDS,
     nonce: crypto.randomUUID()
@@ -228,9 +248,7 @@ function validOrigin(request, env) {
 }
 
 function corsHeaders(origin, env) {
-  const allowed = allowedOrigins(env);
-
-  if (!origin || !allowed.includes(origin)) {
+  if (!origin || !allowedOrigins(env).includes(origin)) {
     return {};
   }
 
@@ -242,10 +260,6 @@ function corsHeaders(origin, env) {
     "Vary": "Origin"
   };
 }
-
-// ==========================================
-// SECURITY RESPONSE HEADERS
-// ==========================================
 
 function secureResponse(response, request, env) {
   const headers = new Headers(response.headers);
@@ -269,68 +283,18 @@ function secureResponse(response, request, env) {
 }
 
 // ==========================================
-// REQUEST BODY
-// ==========================================
-
-async function body(request) {
-  const contentType = request.headers.get("Content-Type") || "";
-
-  if (!contentType.toLowerCase().includes("application/json")) {
-    throw new Error("نوع البيانات غير صالح");
-  }
-
-  const declaredLength = Number(
-    request.headers.get("Content-Length") || 0
-  );
-
-  if (declaredLength > MAX_BODY_SIZE) {
-    throw new Error("حجم البيانات كبير");
-  }
-
-  const buffer = await request.arrayBuffer();
-
-  if (buffer.byteLength > MAX_BODY_SIZE) {
-    throw new Error("حجم البيانات كبير");
-  }
-
-  const data = JSON.parse(
-    new TextDecoder().decode(buffer)
-  );
-
-  if (
-    !data ||
-    typeof data !== "object" ||
-    Array.isArray(data)
-  ) {
-    throw new Error("بيانات غير صالحة");
-  }
-
-  return data;
-}
-
-// ==========================================
-// INPUT CLEANING
-// ==========================================
-
-function clean(value, max) {
-  return String(value ?? "")
-    .normalize("NFKC")
-    .trim()
-    .replace(/\s+/g, " ")
-    .slice(0, max);
-}
-
-// ==========================================
-// LOGIN RATE LIMIT
+// ADMIN RATE LIMIT
 // ==========================================
 
 async function rateLimit(env, ipHash) {
-  const now = Date.now();
-  const windowStart = now - 15 * 60 * 1000;
+  const windowStart = Date.now() - 15 * 60 * 1000;
 
-  const row = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM login_attempts WHERE ip_hash=? AND created_at>?"
-  )
+  const row = await env.DB.prepare(`
+    SELECT COUNT(*) AS n
+    FROM login_attempts
+    WHERE ip_hash = ?
+      AND created_at > ?
+  `)
     .bind(ipHash, windowStart)
     .first();
 
@@ -338,15 +302,27 @@ async function rateLimit(env, ipHash) {
 }
 
 async function recordFailure(env, ipHash) {
-  await env.DB.prepare(
-    "INSERT INTO login_attempts(ip_hash, created_at) VALUES(?, ?)"
-  )
+  await env.DB.prepare(`
+    INSERT INTO login_attempts(ip_hash, created_at)
+    VALUES(?, ?)
+  `)
     .bind(ipHash, Date.now())
     .run();
 }
 
 // ==========================================
-// MAIN API HANDLER
+// ADMIN AUTHORIZATION
+// ==========================================
+
+async function requireAdmin(request, env) {
+  return (
+    validOrigin(request, env) &&
+    await validSession(request, env)
+  );
+}
+
+// ==========================================
+// MAIN API
 // ==========================================
 
 async function handle(request, env) {
@@ -356,13 +332,11 @@ async function handle(request, env) {
 
   // CORS preflight
   if (method === "OPTIONS") {
-    return new Response(null, {
-      status: 204
-    });
+    return new Response(null, { status: 204 });
   }
 
   // ========================================
-  // HEALTH CHECK
+  // HEALTH
   // ========================================
 
   if (path === "/api/health" && method === "GET") {
@@ -381,9 +355,7 @@ async function handle(request, env) {
     method === "POST"
   ) {
     if (!validOrigin(request, env)) {
-      return json({
-        error: "مصدر الطلب غير مسموح"
-      }, 403);
+      return json({ error: "مصدر الطلب غير مسموح" }, 403);
     }
 
     let data;
@@ -391,24 +363,35 @@ async function handle(request, env) {
     try {
       data = await body(request);
     } catch {
-      return json({
-        error: "بيانات غير صالحة"
-      }, 400);
+      return json({ error: "بيانات غير صالحة" }, 400);
     }
 
     const firstName = clean(data.firstName, 60);
     const lastName = clean(data.lastName, 60);
     const className = clean(data.className, 40);
 
-    if (!firstName || !lastName || !className) {
+    if (
+      firstName.length < 2 ||
+      lastName.length < 2 ||
+      !className
+    ) {
       return json({
-        error: "يرجى ملء جميع الحقول"
+        error: "يرجى إدخال الاسم واللقب واختيار القسم بشكل صحيح"
       }, 400);
     }
 
-    if (firstName.length < 2 || lastName.length < 2) {
+    // Find the selected class
+    const selectedClass = await env.DB.prepare(`
+      SELECT id, name
+      FROM classes
+      WHERE name = ?
+    `)
+      .bind(className)
+      .first();
+
+    if (!selectedClass) {
       return json({
-        error: "الاسم واللقب يجب أن يحتوي كل منهما على حرفين على الأقل"
+        error: "القسم المختار غير موجود"
       }, 400);
     }
 
@@ -418,21 +401,27 @@ async function handle(request, env) {
       crypto.randomUUID() + crypto.randomUUID();
 
     const tokenHash = await digest(token);
-    const createdAt = Date.now();
+    const now = Date.now();
 
     await env.DB.prepare(`
-      INSERT INTO student_requests
-      (id, first_name, last_name, class_name, status, token_hash, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO student_requests (
+        id,
+        first_name,
+        last_name,
+        class_id,
+        status,
+        tracking_token_hash,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, 'pending', ?, ?)
     `)
       .bind(
         id,
         firstName,
         lastName,
-        className,
-        "pending",
+        selectedClass.id,
         tokenHash,
-        createdAt
+        now
       )
       .run();
 
@@ -461,9 +450,11 @@ async function handle(request, env) {
       }, 401);
     }
 
-    const row = await env.DB.prepare(
-      "SELECT status FROM student_requests WHERE token_hash=?"
-    )
+    const row = await env.DB.prepare(`
+      SELECT status, student_id
+      FROM student_requests
+      WHERE tracking_token_hash = ?
+    `)
       .bind(await digest(token))
       .first();
 
@@ -474,7 +465,8 @@ async function handle(request, env) {
     }
 
     return json({
-      status: row.status
+      status: row.status,
+      setupAvailable: row.status === "approved" && !!row.student_id
     });
   }
 
@@ -487,9 +479,7 @@ async function handle(request, env) {
     method === "POST"
   ) {
     if (!validOrigin(request, env)) {
-      return json({
-        error: "مصدر الطلب غير مسموح"
-      }, 403);
+      return json({ error: "مصدر الطلب غير مسموح" }, 403);
     }
 
     if (
@@ -520,9 +510,7 @@ async function handle(request, env) {
     try {
       data = await body(request);
     } catch {
-      return json({
-        error: "بيانات غير صالحة"
-      }, 400);
+      return json({ error: "بيانات غير صالحة" }, 400);
     }
 
     const codeOk = safeEqual(
@@ -543,9 +531,10 @@ async function handle(request, env) {
       }, 401);
     }
 
-    await env.DB.prepare(
-      "DELETE FROM login_attempts WHERE ip_hash=?"
-    )
+    await env.DB.prepare(`
+      DELETE FROM login_attempts
+      WHERE ip_hash = ?
+    `)
       .bind(ipHash)
       .run();
 
@@ -566,13 +555,8 @@ async function handle(request, env) {
     path === "/api/admin/logout" &&
     method === "POST"
   ) {
-    if (
-      !validOrigin(request, env) ||
-      !await validSession(request, env)
-    ) {
-      return json({
-        error: "غير مصرح"
-      }, 401);
+    if (!await requireAdmin(request, env)) {
+      return json({ error: "غير مصرح" }, 401);
     }
 
     return json({
@@ -590,25 +574,22 @@ async function handle(request, env) {
     path === "/api/admin/requests" &&
     method === "GET"
   ) {
-    if (
-      !validOrigin(request, env) ||
-      !await validSession(request, env)
-    ) {
-      return json({
-        error: "غير مصرح"
-      }, 401);
+    if (!await requireAdmin(request, env)) {
+      return json({ error: "غير مصرح" }, 401);
     }
 
     const result = await env.DB.prepare(`
       SELECT
-        id,
-        first_name AS firstName,
-        last_name AS lastName,
-        class_name AS className,
-        status,
-        created_at AS createdAt
-      FROM student_requests
-      ORDER BY created_at DESC
+        r.id,
+        r.first_name AS firstName,
+        r.last_name AS lastName,
+        c.name AS className,
+        r.status,
+        r.created_at AS createdAt,
+        r.reviewed_at AS reviewedAt
+      FROM student_requests r
+      JOIN classes c ON c.id = r.class_id
+      ORDER BY r.created_at DESC
       LIMIT 200
     `).all();
 
@@ -626,13 +607,8 @@ async function handle(request, env) {
   );
 
   if (match && method === "PATCH") {
-    if (
-      !validOrigin(request, env) ||
-      !await validSession(request, env)
-    ) {
-      return json({
-        error: "غير مصرح"
-      }, 401);
+    if (!await requireAdmin(request, env)) {
+      return json({ error: "غير مصرح" }, 401);
     }
 
     let data;
@@ -640,45 +616,43 @@ async function handle(request, env) {
     try {
       data = await body(request);
     } catch {
-      return json({
-        error: "بيانات غير صالحة"
-      }, 400);
+      return json({ error: "بيانات غير صالحة" }, 400);
     }
 
     if (!["approved", "rejected"].includes(data.status)) {
-      return json({
-        error: "قرار غير صالح"
-      }, 400);
+      return json({ error: "قرار غير صالح" }, 400);
     }
 
-    const studentId = match[1];
+    const requestId = match[1];
+    const now = Date.now();
 
-    // Check that the request exists and is still pending.
-    const student = await env.DB.prepare(`
+    const existing = await env.DB.prepare(`
       SELECT id, status
       FROM student_requests
-      WHERE id=?
+      WHERE id = ?
     `)
-      .bind(studentId)
+      .bind(requestId)
       .first();
 
-    if (!student || student.status !== "pending") {
+    if (!existing || existing.status !== "pending") {
       return json({
         error: "الطلب غير موجود أو تمت معالجته سابقاً"
       }, 409);
     }
 
     // --------------------------------------
-    // REJECT REQUEST
+    // REJECT
     // --------------------------------------
 
     if (data.status === "rejected") {
       const result = await env.DB.prepare(`
         UPDATE student_requests
-        SET status='rejected'
-        WHERE id=? AND status='pending'
+        SET status = 'rejected',
+            reviewed_at = ?
+        WHERE id = ?
+          AND status = 'pending'
       `)
-        .bind(studentId)
+        .bind(now, requestId)
         .run();
 
       if (!result.meta?.changes) {
@@ -687,6 +661,23 @@ async function handle(request, env) {
         }, 409);
       }
 
+      await env.DB.prepare(`
+        INSERT INTO attendance_audit (
+          id,
+          admin_action,
+          target_student_id,
+          details,
+          created_at
+        )
+        VALUES (?, 'request_rejected', NULL, ?, ?)
+      `)
+        .bind(
+          crypto.randomUUID(),
+          JSON.stringify({ requestId }),
+          now
+        )
+        .run();
+
       return json({
         ok: true,
         status: "rejected"
@@ -694,72 +685,81 @@ async function handle(request, env) {
     }
 
     // --------------------------------------
-    // APPROVE REQUEST + CREATE ACTIVATION CODE
+    // APPROVE: CREATE STUDENT ACCOUNT
     // --------------------------------------
 
-    const activationCode = generateActivationCode();
-    const activationHash = await hashActivationCode(
-      activationCode
-    );
+    const studentId = crypto.randomUUID();
 
-    const activationId = crypto.randomUUID();
-    const now = Date.now();
-
-    // Both statements execute together as a D1 batch.
-    // The code hash is stored, never the original code.
     const results = await env.DB.batch([
       env.DB.prepare(`
-        UPDATE student_requests
-        SET status='approved'
-        WHERE id=? AND status='pending'
-      `).bind(studentId),
+        INSERT INTO students (
+          id,
+          first_name,
+          last_name,
+          class_id,
+          account_status,
+          created_at,
+          updated_at
+        )
+        SELECT
+          ?,
+          first_name,
+          last_name,
+          class_id,
+          'active',
+          ?,
+          ?
+        FROM student_requests
+        WHERE id = ?
+          AND status = 'pending'
+          AND student_id IS NULL
+      `)
+        .bind(studentId, now, now, requestId),
 
       env.DB.prepare(`
-        INSERT INTO student_activation_codes
-        (id, student_id, code_hash, created_at)
-        SELECT ?, id, ?, ?
-        FROM student_requests
-        WHERE id=?
-          AND status='approved'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM student_activation_codes
-            WHERE student_id=?
-          )
-      `).bind(
-        activationId,
-        activationHash,
-        now,
-        studentId,
-        studentId
-      )
+        UPDATE student_requests
+        SET status = 'approved',
+            student_id = ?,
+            reviewed_at = ?
+        WHERE id = ?
+          AND status = 'pending'
+          AND student_id IS NULL
+      `)
+        .bind(studentId, now, requestId)
     ]);
 
-    const updated = results[0]?.meta?.changes || 0;
-    const inserted = results[1]?.meta?.changes || 0;
+    const created = results[0]?.meta?.changes || 0;
+    const updated = results[1]?.meta?.changes || 0;
 
-    if (!updated) {
+    if (!created || !updated) {
       return json({
-        error: "الطلب غير موجود أو تمت معالجته سابقاً"
+        error: "تعذرت الموافقة على الطلب. ربما تمت معالجته مسبقاً."
       }, 409);
     }
 
-    if (!inserted) {
-      console.error(
-        "Activation code was not inserted for student:",
-        studentId
-      );
+    await env.DB.prepare(`
+      INSERT INTO attendance_audit (
+        id,
+        admin_action,
+        target_student_id,
+        details,
+        created_at
+      )
+      VALUES (?, 'student_approved', ?, ?, ?)
+    `)
+      .bind(
+        crypto.randomUUID(),
+        studentId,
+        JSON.stringify({ requestId }),
+        now
+      )
+      .run();
 
-      return json({
-        error: "تم قبول الطلب لكن تعذر إنشاء رمز التفعيل. يرجى مراجعة قاعدة البيانات."
-      }, 500);
-    }
-
-    // The original activation code is returned only once.
     return json({
       ok: true,
       status: "approved",
-      activationCode
+      studentId,
+      setupAvailable: true
     });
   }
 
@@ -786,11 +786,13 @@ export default {
     } catch (error) {
       console.error("API error:", error);
 
-      const response = json({
-        error: "خطأ داخلي في الخادم"
-      }, 500);
-
-      return secureResponse(response, request, env);
+      return secureResponse(
+        json({
+          error: "خطأ داخلي في الخادم"
+        }, 500),
+        request,
+        env
+      );
     }
   }
 };
