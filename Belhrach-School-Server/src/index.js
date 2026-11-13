@@ -1086,7 +1086,6 @@ async function verifyAttendance(request, env) {
     }, 400);
   }
 
-  // Re-check attendance time before saving.
   const finalClock = await getAttendanceClock(env);
 
   if (
@@ -1107,8 +1106,6 @@ async function verifyAttendance(request, env) {
 
   try {
     const results = await env.DB.batch([
-      // Insert attendance only if the challenge and credential
-      // are still valid and today's attendance does not exist.
       env.DB.prepare(`
         INSERT INTO attendance_records (
           id,
@@ -1160,7 +1157,6 @@ async function verifyAttendance(request, env) {
         finalClock.date
       ),
 
-      // Consume challenge only after attendance was inserted.
       env.DB.prepare(`
         DELETE FROM webauthn_challenges
         WHERE id = ?
@@ -1177,7 +1173,6 @@ async function verifyAttendance(request, env) {
         attendanceId
       ),
 
-      // Update credential counter only after attendance exists.
       env.DB.prepare(`
         UPDATE student_credentials
         SET sign_count = ?,
@@ -1198,7 +1193,6 @@ async function verifyAttendance(request, env) {
         attendanceId
       ),
 
-      // Add audit record only after attendance exists.
       env.DB.prepare(`
         INSERT INTO attendance_audit (
           id,
@@ -1267,6 +1261,7 @@ async function verifyAttendance(request, env) {
     attendance: {
       date: finalClock.date,
       time: finalClock.time,
+      checkInAt: finalClock.timestamp,
       status,
       timezone: finalClock.timezone
     },
@@ -1333,17 +1328,11 @@ async function handle(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // ========================================
-  // CORS PREFLIGHT
-  // ========================================
-
   if (method === "OPTIONS") {
     return new Response(null, { status: 204 });
   }
 
-  // ========================================
   // HEALTH
-  // ========================================
 
   if (path === "/api/health" && method === "GET") {
     return json({
@@ -1352,9 +1341,7 @@ async function handle(request, env) {
     });
   }
 
-  // ========================================
   // STUDENT: CREATE REQUEST
-  // ========================================
 
   if (
     path === "/api/student/requests" &&
@@ -1401,10 +1388,7 @@ async function handle(request, env) {
     }
 
     const id = crypto.randomUUID();
-
-    const token =
-      crypto.randomUUID() + crypto.randomUUID();
-
+    const token = crypto.randomUUID() + crypto.randomUUID();
     const tokenHash = await digest(token);
     const now = Date.now();
 
@@ -1437,9 +1421,7 @@ async function handle(request, env) {
     }, 201);
   }
 
-  // ========================================
   // STUDENT: CHECK REQUEST STATUS
-  // ========================================
 
   if (
     path === "/api/student/status" &&
@@ -1473,9 +1455,7 @@ async function handle(request, env) {
     });
   }
 
-  // ========================================
-  // STUDENT: WEBAUTHN REGISTRATION OPTIONS
-  // ========================================
+  // STUDENT: REGISTRATION OPTIONS
 
   if (
     path === "/api/student/webauthn/register/options" &&
@@ -1484,9 +1464,7 @@ async function handle(request, env) {
     return await registrationOptions(request, env);
   }
 
-  // ========================================
-  // STUDENT: WEBAUTHN REGISTRATION VERIFY
-  // ========================================
+  // STUDENT: REGISTRATION VERIFY
 
   if (
     path === "/api/student/webauthn/register/verify" &&
@@ -1495,9 +1473,7 @@ async function handle(request, env) {
     return await verifyRegistration(request, env);
   }
 
-  // ========================================
-  // STUDENT: ATTENDANCE AUTHENTICATION OPTIONS
-  // ========================================
+  // STUDENT: ATTENDANCE OPTIONS
 
   if (
     path === "/api/student/webauthn/attendance/options" &&
@@ -1506,9 +1482,7 @@ async function handle(request, env) {
     return await attendanceOptions(request, env);
   }
 
-  // ========================================
-  // STUDENT: VERIFY AND RECORD ATTENDANCE
-  // ========================================
+  // STUDENT: ATTENDANCE VERIFY
 
   if (
     path === "/api/student/webauthn/attendance/verify" &&
@@ -1517,9 +1491,7 @@ async function handle(request, env) {
     return await verifyAttendance(request, env);
   }
 
-  // ========================================
   // STUDENT: TODAY ATTENDANCE
-  // ========================================
 
   if (
     path === "/api/student/attendance/today" &&
@@ -1528,9 +1500,7 @@ async function handle(request, env) {
     return await studentTodayAttendance(request, env);
   }
 
-  // ========================================
   // ADMIN: LOGIN
-  // ========================================
 
   if (
     path === "/api/admin/login" &&
@@ -1605,9 +1575,7 @@ async function handle(request, env) {
     });
   }
 
-  // ========================================
   // ADMIN: LOGOUT
-  // ========================================
 
   if (
     path === "/api/admin/logout" &&
@@ -1624,9 +1592,7 @@ async function handle(request, env) {
     });
   }
 
-  // ========================================
   // ADMIN: GET REQUESTS
-  // ========================================
 
   if (
     path === "/api/admin/requests" &&
@@ -1673,9 +1639,7 @@ async function handle(request, env) {
     });
   }
 
-  // ========================================
   // ADMIN: GET STUDENTS BY CLASS
-  // ========================================
 
   const classStudentsMatch = path.match(
     /^\/api\/admin\/classes\/(.+)\/students$/
@@ -1770,7 +1734,7 @@ async function handle(request, env) {
         deviceRevoked: Boolean(student.deviceRevoked),
         attendanceStatus: student.accountStatus === "active"
           ? getAttendanceStatus(record, clock)
-          : "inactive"
+          : "suspended"
       };
     });
 
@@ -1793,9 +1757,7 @@ async function handle(request, env) {
     });
   }
 
-  // ========================================
   // ADMIN: APPROVE / REJECT REQUEST
-  // ========================================
 
   const match = path.match(
     /^\/api\/admin\/requests\/([0-9a-f-]{36})$/i
@@ -1835,7 +1797,6 @@ async function handle(request, env) {
       }, 409);
     }
 
-    // REJECT
     if (data.status === "rejected") {
       const result = await env.DB.prepare(`
         UPDATE student_requests
@@ -1876,7 +1837,6 @@ async function handle(request, env) {
       });
     }
 
-    // APPROVE: CREATE STUDENT ACCOUNT
     const studentId = crypto.randomUUID();
 
     const results = await env.DB.batch([
@@ -1952,9 +1912,7 @@ async function handle(request, env) {
     });
   }
 
-  // ========================================
   // NOT FOUND
-  // ========================================
 
   return json({
     error: "المسار غير موجود"
