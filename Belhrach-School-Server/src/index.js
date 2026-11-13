@@ -1,7 +1,9 @@
 
 import {
   generateRegistrationOptions,
-  verifyRegistrationResponse
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse
 } from "@simplewebauthn/server";
 
 const JSON_HEADERS = {
@@ -385,6 +387,23 @@ function bytesToBase64Url(bytes) {
     .replace(/=+$/g, "");
 }
 
+function base64UrlToBytes(value) {
+  const normalized = String(value)
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
+  const padded = normalized + "=".repeat(
+    (4 - normalized.length % 4) % 4
+  );
+
+  const binary = atob(padded);
+
+  return Uint8Array.from(
+    binary,
+    char => char.charCodeAt(0)
+  );
+}
+
 async function getApprovedStudent(env, token) {
   if (!token || token.length < 50 || token.length > 150) {
     return null;
@@ -407,6 +426,104 @@ async function getApprovedStudent(env, token) {
   `)
     .bind(await digest(token))
     .first();
+}
+
+async function getActiveCredential(env, studentId) {
+  return await env.DB.prepare(`
+    SELECT
+      id,
+      credential_id,
+      public_key,
+      sign_count,
+      transports,
+      device_name
+    FROM student_credentials
+    WHERE student_id = ?
+      AND revoked_at IS NULL
+    LIMIT 1
+  `)
+    .bind(studentId)
+    .first();
+}
+
+// ==========================================
+// ATTENDANCE CLOCK
+// ==========================================
+
+async function getAttendanceClock(env) {
+  const settings = await env.DB.prepare(`
+    SELECT
+      timezone,
+      opening_time,
+      late_time,
+      closing_time
+    FROM attendance_settings
+    WHERE id = 1
+    LIMIT 1
+  `).first();
+
+  if (!settings) {
+    throw new Error("Attendance settings are missing");
+  }
+
+  const timezone = settings.timezone || "Africa/Algiers";
+
+  const now = new Date();
+
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(now);
+
+  const values = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      values[part.type] = part.value;
+    }
+  }
+
+  const date = `${values.year}-${values.month}-${values.day}`;
+  const time = `${values.hour}:${values.minute}`;
+
+  return {
+    date,
+    time,
+    timezone,
+    openingTime: settings.opening_time,
+    lateTime: settings.late_time,
+    closingTime: settings.closing_time,
+    timestamp: now.getTime()
+  };
+}
+
+function attendanceWindow(clock) {
+  if (clock.time < clock.openingTime) {
+    return "not_open";
+  }
+
+  if (clock.time > clock.closingTime) {
+    return "closed";
+  }
+
+  return "open";
+}
+
+function getAttendanceStatus(record, clock) {
+  if (record?.status === "present") return "present";
+  if (record?.status === "late") return "late";
+
+  const window = attendanceWindow(clock);
+
+  if (window === "not_open") return "not_open";
+  if (window === "closed") return "absent";
+
+  return "not_yet";
 }
 
 // ==========================================
@@ -690,6 +807,524 @@ async function verifyRegistration(request, env) {
 }
 
 // ==========================================
+// ATTENDANCE: AUTHENTICATION OPTIONS
+// ==========================================
+
+async function attendanceOptions(request, env) {
+  if (!validStudentOrigin(request, env)) {
+    return json({ error: "مصدر الطلب غير مسموح" }, 403);
+  }
+
+  const student = await getApprovedStudent(
+    env,
+    bearerToken(request)
+  );
+
+  if (!student) {
+    return json({
+      error: "الحساب غير موجود أو غير مفعل"
+    }, 401);
+  }
+
+  const credential = await getActiveCredential(
+    env,
+    student.student_id
+  );
+
+  if (!credential) {
+    return json({
+      error: "لم يتم ربط جهاز بهذا الحساب. اربط جهازك أولاً."
+    }, 409);
+  }
+
+  const clock = await getAttendanceClock(env);
+  const window = attendanceWindow(clock);
+
+  if (window === "not_open") {
+    return json({
+      error: `لم يبدأ وقت تسجيل الحضور بعد. يبدأ عند ${clock.openingTime}.`
+    }, 403);
+  }
+
+  if (window === "closed") {
+    return json({
+      error: "انتهى وقت تسجيل الحضور لهذا اليوم."
+    }, 403);
+  }
+
+  const existing = await env.DB.prepare(`
+    SELECT id, status, check_in_at
+    FROM attendance_records
+    WHERE student_id = ?
+      AND attendance_date = ?
+    LIMIT 1
+  `)
+    .bind(student.student_id, clock.date)
+    .first();
+
+  if (existing) {
+    return json({
+      error: "تم تسجيل حضورك اليوم مسبقاً.",
+      alreadyRecorded: true,
+      attendance: {
+        status: existing.status,
+        checkInAt: existing.check_in_at
+      }
+    }, 409);
+  }
+
+  const config = getWebAuthnConfig(env);
+
+  let transports = [];
+
+  try {
+    transports = JSON.parse(credential.transports || "[]");
+  } catch {
+    transports = [];
+  }
+
+  const options = await generateAuthenticationOptions({
+    rpID: config.rpID,
+    timeout: 60000,
+    userVerification: "required",
+    allowCredentials: [{
+      id: credential.credential_id,
+      transports
+    }]
+  });
+
+  const now = Date.now();
+  const challengeId = crypto.randomUUID();
+
+  await env.DB.prepare(`
+    DELETE FROM webauthn_challenges
+    WHERE student_id = ?
+      AND purpose = 'attendance'
+      AND expires_at <= ?
+  `)
+    .bind(student.student_id, now)
+    .run();
+
+  await env.DB.prepare(`
+    INSERT INTO webauthn_challenges (
+      id,
+      challenge,
+      student_id,
+      purpose,
+      expires_at,
+      created_at
+    )
+    VALUES (?, ?, ?, 'attendance', ?, ?)
+  `)
+    .bind(
+      challengeId,
+      options.challenge,
+      student.student_id,
+      now + CHALLENGE_TTL,
+      now
+    )
+    .run();
+
+  return json({
+    options,
+    challengeId
+  });
+}
+
+// ==========================================
+// ATTENDANCE: VERIFY AND RECORD
+// ==========================================
+
+async function verifyAttendance(request, env) {
+  if (!validStudentOrigin(request, env)) {
+    return json({ error: "مصدر الطلب غير مسموح" }, 403);
+  }
+
+  let data;
+
+  try {
+    data = await webauthnBody(request);
+  } catch {
+    return json({ error: "بيانات التحقق غير صالحة" }, 400);
+  }
+
+  const student = await getApprovedStudent(
+    env,
+    bearerToken(request)
+  );
+
+  if (!student) {
+    return json({
+      error: "الحساب غير موجود أو غير مفعل"
+    }, 401);
+  }
+
+  const challengeId = String(data.challengeId || "");
+
+  if (!/^[0-9a-f-]{36}$/i.test(challengeId)) {
+    return json({ error: "طلب الحضور غير صالح" }, 400);
+  }
+
+  if (!data.response || typeof data.response !== "object") {
+    return json({ error: "استجابة الجهاز غير صالحة" }, 400);
+  }
+
+  const now = Date.now();
+
+  const challengeRow = await env.DB.prepare(`
+    SELECT id, challenge
+    FROM webauthn_challenges
+    WHERE id = ?
+      AND student_id = ?
+      AND purpose = 'attendance'
+      AND expires_at > ?
+    LIMIT 1
+  `)
+    .bind(challengeId, student.student_id, now)
+    .first();
+
+  if (!challengeRow) {
+    return json({
+      error: "انتهت صلاحية طلب الحضور. حاول مجدداً."
+    }, 400);
+  }
+
+  const credential = await getActiveCredential(
+    env,
+    student.student_id
+  );
+
+  if (!credential) {
+    return json({
+      error: "الجهاز غير مربوط أو تم إلغاؤه."
+    }, 409);
+  }
+
+  const clock = await getAttendanceClock(env);
+  const window = attendanceWindow(clock);
+
+  if (window !== "open") {
+    return json({
+      error: window === "not_open"
+        ? "لم يبدأ وقت تسجيل الحضور."
+        : "انتهى وقت تسجيل الحضور."
+    }, 403);
+  }
+
+  const existing = await env.DB.prepare(`
+    SELECT id, status, check_in_at
+    FROM attendance_records
+    WHERE student_id = ?
+      AND attendance_date = ?
+    LIMIT 1
+  `)
+    .bind(student.student_id, clock.date)
+    .first();
+
+  if (existing) {
+    return json({
+      error: "تم تسجيل حضورك اليوم مسبقاً.",
+      alreadyRecorded: true
+    }, 409);
+  }
+
+  const config = getWebAuthnConfig(env);
+
+  let transports = [];
+
+  try {
+    transports = JSON.parse(credential.transports || "[]");
+  } catch {
+    transports = [];
+  }
+
+  const storedCredential = {
+    id: credential.credential_id,
+    publicKey: base64UrlToBytes(credential.public_key),
+    counter: Number(credential.sign_count) || 0,
+    transports
+  };
+
+  let verification;
+
+  try {
+    verification = await verifyAuthenticationResponse({
+      response: data.response,
+      expectedChallenge: challengeRow.challenge,
+      expectedOrigin: config.expectedOrigin,
+      expectedRPID: config.rpID,
+      credential: storedCredential,
+      requireUserVerification: true
+    });
+  } catch (error) {
+    console.error(
+      "WebAuthn attendance verification failed:",
+      error
+    );
+
+    return json({
+      error: "فشل التحقق من الجهاز. حاول مجدداً."
+    }, 400);
+  }
+
+  if (
+    !verification.verified ||
+    !verification.authenticationInfo
+  ) {
+    return json({
+      error: "لم ينجح التحقق من الجهاز."
+    }, 400);
+  }
+
+  const newCounter = Number(
+    verification.authenticationInfo.newCounter
+  );
+
+  if (!Number.isSafeInteger(newCounter) || newCounter < 0) {
+    return json({
+      error: "عداد التحقق من الجهاز غير صالح."
+    }, 400);
+  }
+
+  // Re-check attendance time before saving.
+  const finalClock = await getAttendanceClock(env);
+
+  if (
+    finalClock.date !== clock.date ||
+    attendanceWindow(finalClock) !== "open"
+  ) {
+    return json({
+      error: "انتهت نافذة تسجيل الحضور. لم يتم تسجيل حضورك."
+    }, 403);
+  }
+
+  const status = finalClock.time < finalClock.lateTime
+    ? "present"
+    : "late";
+
+  const attendanceId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+
+  try {
+    const results = await env.DB.batch([
+      // Insert attendance only if the challenge and credential
+      // are still valid and today's attendance does not exist.
+      env.DB.prepare(`
+        INSERT INTO attendance_records (
+          id,
+          student_id,
+          attendance_date,
+          check_in_at,
+          status,
+          verification_method,
+          created_at
+        )
+        SELECT
+          ?, ?, ?, ?, ?, 'webauthn', ?
+        WHERE EXISTS (
+          SELECT 1
+          FROM webauthn_challenges
+          WHERE id = ?
+            AND student_id = ?
+            AND purpose = 'attendance'
+            AND expires_at > ?
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM student_credentials
+          WHERE id = ?
+            AND student_id = ?
+            AND revoked_at IS NULL
+            AND sign_count = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM attendance_records
+          WHERE student_id = ?
+            AND attendance_date = ?
+        )
+      `).bind(
+        attendanceId,
+        student.student_id,
+        finalClock.date,
+        finalClock.timestamp,
+        status,
+        finalClock.timestamp,
+        challengeId,
+        student.student_id,
+        finalClock.timestamp,
+        credential.id,
+        student.student_id,
+        Number(credential.sign_count) || 0,
+        student.student_id,
+        finalClock.date
+      ),
+
+      // Consume challenge only after attendance was inserted.
+      env.DB.prepare(`
+        DELETE FROM webauthn_challenges
+        WHERE id = ?
+          AND student_id = ?
+          AND purpose = 'attendance'
+          AND EXISTS (
+            SELECT 1
+            FROM attendance_records
+            WHERE id = ?
+          )
+      `).bind(
+        challengeId,
+        student.student_id,
+        attendanceId
+      ),
+
+      // Update credential counter only after attendance exists.
+      env.DB.prepare(`
+        UPDATE student_credentials
+        SET sign_count = ?,
+            last_used_at = ?
+        WHERE id = ?
+          AND student_id = ?
+          AND revoked_at IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM attendance_records
+            WHERE id = ?
+          )
+      `).bind(
+        newCounter,
+        finalClock.timestamp,
+        credential.id,
+        student.student_id,
+        attendanceId
+      ),
+
+      // Add audit record only after attendance exists.
+      env.DB.prepare(`
+        INSERT INTO attendance_audit (
+          id,
+          admin_action,
+          target_student_id,
+          details,
+          created_at
+        )
+        SELECT
+          ?, 'student_attendance_recorded', ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1
+          FROM attendance_records
+          WHERE id = ?
+        )
+      `).bind(
+        auditId,
+        student.student_id,
+        JSON.stringify({
+          date: finalClock.date,
+          time: finalClock.time,
+          status,
+          verificationMethod: "webauthn"
+        }),
+        finalClock.timestamp,
+        attendanceId
+      )
+    ]);
+
+    const inserted = results[0]?.meta?.changes || 0;
+
+    if (!inserted) {
+      const already = await env.DB.prepare(`
+        SELECT id
+        FROM attendance_records
+        WHERE student_id = ?
+          AND attendance_date = ?
+        LIMIT 1
+      `)
+        .bind(student.student_id, finalClock.date)
+        .first();
+
+      if (already) {
+        return json({
+          error: "تم تسجيل حضورك اليوم مسبقاً.",
+          alreadyRecorded: true
+        }, 409);
+      }
+
+      return json({
+        error: "تعذر تسجيل الحضور. انتهت صلاحية الطلب أو تغيرت حالة الجهاز."
+      }, 409);
+    }
+
+  } catch (error) {
+    console.error("Attendance database transaction failed:", error);
+
+    return json({
+      error: "تعذر حفظ الحضور. ربما تم تسجيله مسبقاً."
+    }, 409);
+  }
+
+  return json({
+    ok: true,
+    recorded: true,
+    attendance: {
+      date: finalClock.date,
+      time: finalClock.time,
+      status,
+      timezone: finalClock.timezone
+    },
+    message: status === "present"
+      ? "تم تسجيل حضورك بنجاح."
+      : "تم تسجيل حضورك، لكنك متأخر."
+  });
+}
+
+// ==========================================
+// STUDENT: GET TODAY ATTENDANCE
+// ==========================================
+
+async function studentTodayAttendance(request, env) {
+  if (!validStudentOrigin(request, env)) {
+    return json({ error: "مصدر الطلب غير مسموح" }, 403);
+  }
+
+  const student = await getApprovedStudent(
+    env,
+    bearerToken(request)
+  );
+
+  if (!student) {
+    return json({
+      error: "الحساب غير موجود أو غير مفعل"
+    }, 401);
+  }
+
+  const clock = await getAttendanceClock(env);
+
+  const record = await env.DB.prepare(`
+    SELECT
+      attendance_date AS date,
+      check_in_at AS checkInAt,
+      status,
+      verification_method AS verificationMethod
+    FROM attendance_records
+    WHERE student_id = ?
+      AND attendance_date = ?
+    LIMIT 1
+  `)
+    .bind(student.student_id, clock.date)
+    .first();
+
+  const status = getAttendanceStatus(record, clock);
+
+  return json({
+    ok: true,
+    date: clock.date,
+    time: clock.time,
+    timezone: clock.timezone,
+    status,
+    attendance: record || null
+  });
+}
+
+// ==========================================
 // MAIN API
 // ==========================================
 
@@ -858,6 +1493,39 @@ async function handle(request, env) {
     method === "POST"
   ) {
     return await verifyRegistration(request, env);
+  }
+
+  // ========================================
+  // STUDENT: ATTENDANCE AUTHENTICATION OPTIONS
+  // ========================================
+
+  if (
+    path === "/api/student/webauthn/attendance/options" &&
+    method === "POST"
+  ) {
+    return await attendanceOptions(request, env);
+  }
+
+  // ========================================
+  // STUDENT: VERIFY AND RECORD ATTENDANCE
+  // ========================================
+
+  if (
+    path === "/api/student/webauthn/attendance/verify" &&
+    method === "POST"
+  ) {
+    return await verifyAttendance(request, env);
+  }
+
+  // ========================================
+  // STUDENT: TODAY ATTENDANCE
+  // ========================================
+
+  if (
+    path === "/api/student/attendance/today" &&
+    method === "GET"
+  ) {
+    return await studentTodayAttendance(request, env);
   }
 
   // ========================================
@@ -1046,6 +1714,8 @@ async function handle(request, env) {
       return json({ error: "القسم غير موجود" }, 404);
     }
 
+    const clock = await getAttendanceClock(env);
+
     const result = await env.DB.prepare(`
       SELECT
         s.id,
@@ -1066,12 +1736,19 @@ async function handle(request, env) {
             AND sc.revoked_at IS NOT NULL
           THEN 1
           ELSE 0
-        END AS deviceRevoked
+        END AS deviceRevoked,
+
+        ar.status AS recordedAttendanceStatus,
+        ar.check_in_at AS checkInAt
 
       FROM students s
 
       LEFT JOIN student_credentials sc
         ON sc.student_id = s.id
+
+      LEFT JOIN attendance_records ar
+        ON ar.student_id = s.id
+        AND ar.attendance_date = ?
 
       WHERE s.class_id = ?
 
@@ -1079,20 +1756,37 @@ async function handle(request, env) {
         s.first_name COLLATE NOCASE ASC,
         s.last_name COLLATE NOCASE ASC
     `)
-      .bind(selectedClass.id)
+      .bind(clock.date, selectedClass.id)
       .all();
 
-    const students = (result.results || []).map(student => ({
-      ...student,
-      deviceRegistered: Boolean(student.deviceRegistered),
-      deviceRevoked: Boolean(student.deviceRevoked)
-    }));
+    const students = (result.results || []).map(student => {
+      const record = student.recordedAttendanceStatus
+        ? { status: student.recordedAttendanceStatus }
+        : null;
+
+      return {
+        ...student,
+        deviceRegistered: Boolean(student.deviceRegistered),
+        deviceRevoked: Boolean(student.deviceRevoked),
+        attendanceStatus: student.accountStatus === "active"
+          ? getAttendanceStatus(record, clock)
+          : "inactive"
+      };
+    });
 
     return json({
       ok: true,
       class: {
         id: selectedClass.id,
         name: selectedClass.name
+      },
+      date: clock.date,
+      currentTime: clock.time,
+      timezone: clock.timezone,
+      attendanceTimes: {
+        openingTime: clock.openingTime,
+        lateTime: clock.lateTime,
+        closingTime: clock.closingTime
       },
       total: students.length,
       students
