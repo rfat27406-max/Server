@@ -1,3 +1,4 @@
+
 {
   "name": "belhrach-school-api",
   "version": "1.0.0",
@@ -9,5 +10,10 @@
     "db:create": "wrangler d1 create belhrach-school",
     "db:init": "wrangler d1 execute belhrach-school --remote --file=./schema.sql"
   },
-  "devDependencies": {"wrangler": "^4.0.0"}
+  "dependencies": {
+    "@simplewebauthn/server": "^13.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
 }
